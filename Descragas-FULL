@@ -1,0 +1,583 @@
+import os
+import re
+import string
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox, Label, Entry, Button, filedialog
+from threading import Thread
+from instaloader import Instaloader, Profile, ConnectionException, QueryReturnedBadRequestException
+from yt_dlp import YoutubeDL
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.keys import Keys
+import time
+import pyperclip
+import atexit
+import logging
+
+driver_path = 'D:/Mis-Proyectos/Descarga-tiktok-Maquina-kon/chromedriver.exe'
+#driver_path = 'D:\\Mis-Proyectos\\Programa-Full-Descargas\\chromedriver.exe'
+
+if not os.path.isfile(driver_path):
+    print(f'El archivo no existe en la ruta: {driver_path}')
+else:
+    print(f'El archivo está en la ruta: {driver_path}')
+# Configuración del logger
+logging.basicConfig(filename='error.log', level=logging.ERROR, format='%(asctime)s:%(levelname)s:%(message)s')
+
+# Configuración
+LONGITUD_MAXIMA_NOMBRE_ARCHIVO = 50
+
+# Función para sanitizar el título del archivo
+def sanitize_filename(title):
+    illegal_chars = r'[<>:"/\\|?*\n\t]'
+    sanitized_title = re.sub(illegal_chars, '_', title)
+    sanitized_title = re.sub(r'[:]', '_', sanitized_title)
+    sanitized_title = re.sub(r'\.(?=\w)', '_', sanitized_title)
+    sanitized_title = sanitized_title.strip()
+    sanitized_title = re.sub(r'\s+', ' ', sanitized_title)
+    return sanitized_title[:LONGITUD_MAXIMA_NOMBRE_ARCHIVO]
+
+def clean_filename(counter, text):
+    valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
+    cleaned_text = ''.join(c for c in text if c in valid_chars)
+    return f"{counter}-{cleaned_text[:LONGITUD_MAXIMA_NOMBRE_ARCHIVO]}"
+
+def guardar_urls_pendientes(pending_urls_file, urls):
+    with open(pending_urls_file, 'w') as file:
+        for url in urls:
+            file.write(f"{url}\n")
+
+def cargar_urls_pendientes(pending_urls_file):
+    if os.path.exists(pending_urls_file):
+        with open(pending_urls_file, 'r') as file:
+            return [line.strip() for line in file.readlines()]
+    return []
+
+def extract_username_from_url(url, platform):
+    if platform == "Instagram":
+        match = re.search(r'instagram\.com/([^/?]+)', url)
+    elif platform == "TikTok":
+        match = re.search(r'tiktok\.com/@([^/?]+)', url)
+    else:
+        match = None
+    if match:
+        return match.group(1)
+    return None
+
+def remove_json_xz_files(directory):
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.endswith(".json.xz"):
+                os.remove(os.path.join(root, file))
+
+def write_downloaded_videos_txt(directory, videos):
+    with open(os.path.join(directory, 'downloaded_videos.txt'), 'w', encoding='utf-8') as f:
+        for video in videos:
+            f.write(f"{video}\n")
+
+def remove_non_video_files(directory):
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if not file.endswith(".mp4") and file != "downloaded_videos.txt":
+                os.remove(os.path.join(root, file))
+
+class DescargadorRedesSociales:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Descargador de Redes Sociales")
+        self.root.geometry("800x900")
+        self.setup_gui()
+        self.download_path = ""
+        self.loader = Instaloader()
+        self.video_counter = 1  # Contador global para los nombres de archivos
+        atexit.register(self.on_exit)
+
+    def setup_gui(self):
+        Label(self.root, text="Bienvenido al Descargador de Redes Sociales", font=("Arial", 14)).pack(pady=10)
+
+        frame_main = tk.Frame(self.root)
+        frame_main.pack(pady=10)
+
+        # Etiquetas y campos de entrada
+        Label(frame_main, text="Seleccione la plataforma:").grid(row=0, column=0, padx=10, pady=5, sticky='w')
+        self.platform_var = tk.StringVar(value="TikTok")
+        self.platform_menu = ttk.Combobox(frame_main, textvariable=self.platform_var, values=["TikTok", "YouTube", "Instagram"], state="readonly")
+        self.platform_menu.grid(row=0, column=1, padx=10, pady=5, sticky='w')
+        self.platform_menu.bind("<<ComboboxSelected>>", self.update_platform_options)
+
+        # Campos de entrada y etiquetas para cada campo
+        Label(frame_main, text="Ingrese URL o nombre de usuario:").grid(row=1, column=0, padx=10, pady=5, sticky='w')
+        self.url_entry = tk.Entry(frame_main, width=50)
+        self.url_entry.grid(row=1, column=1, columnspan=3, padx=10, pady=5, sticky='w')
+
+        Label(frame_main, text="Ingrese varias URLs (una por línea):").grid(row=2, column=0, padx=10, pady=5, sticky='w')
+        self.multiple_urls_text = tk.Text(frame_main, width=50, height=5)
+        self.multiple_urls_text.grid(row=2, column=1, columnspan=3, padx=10, pady=5, sticky='w')
+
+        Label(frame_main, text="Seleccione la carpeta de destino:").grid(row=3, column=0, padx=10, pady=5, sticky='w')
+        self.destination_entry = tk.Entry(frame_main, width=50)
+        self.destination_entry.grid(row=3, column=1, columnspan=2, padx=10, pady=5, sticky='w')
+        Button(frame_main, text="Buscar", command=self.select_destination_folder).grid(row=3, column=3, padx=10, pady=5, sticky='w')
+
+        # Mover esta etiqueta y campo de entrada a la posición marcada
+        Label(frame_main, text="URL del perfil de TikTok Ejemplo: https://www.tiktok.com/@canal").grid(row=4, column=0, columnspan=4, padx=10, pady=5, sticky='w')
+        self.perfil_entry = tk.Entry(frame_main, width=50)
+        self.perfil_entry.grid(row=5, column=0, columnspan=4, padx=10, pady=5, sticky='w')
+
+        # Botones
+        Button(frame_main, text="Descargar", command=lambda: Thread(target=self.start_download).start()).grid(row=6, columnspan=4, pady=10)
+
+        self.progress = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(self.root, maximum=100, variable=self.progress)
+        self.progress_bar.pack(fill=tk.X, padx=20, pady=10)
+
+        self.status_label = Label(self.root, text="")
+        self.status_label.pack(pady=5)
+
+        self.text_area = scrolledtext.ScrolledText(self.root, width=90, height=10)
+        self.text_area.pack(pady=10)
+
+        self.total_label = Label(self.root, text="")
+        self.total_label.pack(pady=5)
+
+        Button(self.root, text="Obtener URLs", command=lambda: Thread(target=self.obtener_urls).start()).pack(pady=5)
+        Button(self.root, text="Copiar URLs", command=self.copiar_urls).pack(pady=5)
+
+        Button(self.root, text="Salir", command=self.exit_application).pack(pady=5)
+
+        # Opciones adicionales para YouTube
+        self.youtube_videos_var = tk.BooleanVar(value=True)
+        self.youtube_shorts_var = tk.BooleanVar(value=False)  # Corregido a "value=False"
+        self.instagram_reels_var = tk.BooleanVar(value=True)
+        self.instagram_posts_var = tk.BooleanVar(value=True)
+
+        self.youtube_videos_check = ttk.Checkbutton(frame_main, text="Descargar Videos de YouTube", variable=self.youtube_videos_var)
+        self.youtube_videos_check.grid(row=7, column=0, columnspan=4, padx=10, pady=5, sticky='w')
+
+        self.youtube_shorts_check = ttk.Checkbutton(frame_main, text="Descargar Shorts de YouTube", variable=self.youtube_shorts_var)
+        self.youtube_shorts_check.grid(row=8, column=0, columnspan=4, padx=10, pady=5, sticky='w')
+
+    def update_platform_options(self, event):
+        platform = self.platform_var.get()
+        if platform == "Instagram":
+            self.youtube_videos_check.grid_remove()
+            self.youtube_shorts_check.grid_remove()
+        elif platform == "YouTube":
+            self.youtube_videos_check.grid()
+            self.youtube_shorts_check.grid()
+        else:
+            self.youtube_videos_check.grid_remove()
+            self.youtube_shorts_check.grid_remove()
+
+    def select_destination_folder(self):
+        self.download_path = filedialog.askdirectory()
+        self.destination_entry.delete(0, tk.END)
+        self.destination_entry.insert(0, self.download_path)
+
+    def on_exit(self):
+        pass
+
+    def start_download(self):
+        platform = self.platform_var.get()
+        url = self.url_entry.get().strip()
+        self.download_path = self.destination_entry.get().strip()
+        multiple_urls = self.multiple_urls_text.get("1.0", tk.END).strip().split('\n')
+
+        if not url and not multiple_urls:
+            self.show_temporary_message("Error", "Por favor ingrese una URL o varias URLs.")
+            return
+
+        if not self.download_path:
+            self.show_temporary_message("Error", "Por favor seleccione una carpeta de destino.")
+            return
+
+        all_errors = []
+
+        if platform == "TikTok":
+            if url:
+                errors = self.descargar_video_tiktok(url)
+                all_errors.extend(errors)
+            if multiple_urls:
+                for single_url in multiple_urls:
+                    if single_url.strip():
+                        errors = self.descargar_video_tiktok(single_url.strip())
+                        all_errors.extend(errors)
+        elif platform == "YouTube":
+            download_videos = self.youtube_videos_var.get()
+            download_shorts = self.youtube_shorts_var.get()
+            errors = self.start_download_youtube(url, download_videos, download_shorts)
+            all_errors.extend(errors)
+        elif platform == "Instagram":
+            download_reels = self.instagram_reels_var.get()
+            download_posts = self.instagram_posts_var.get()
+            errors = self.download_profile_instagram(url, download_reels, download_posts)
+            all_errors.extend(errors)
+
+        if all_errors:
+            with open('errors.txt', 'a') as f:
+                for err in all_errors:
+                    f.write(f"{err}\n")
+
+        messagebox.showinfo("Información", "Descargas completas.")
+
+    def show_temporary_message(self, title, message):
+        def close_message():
+            msg.destroy()
+            self.continue_download()
+
+        msg = tk.Toplevel(self.root)
+        msg.title(title)
+        msg.geometry("300x100")
+        tk.Label(msg, text=message, padx=20, pady=20).pack()
+        msg.after(3000, close_message)
+        msg.grab_set()
+        self.root.wait_window(msg)
+
+    def descargar_video_tiktok(self, url):
+        username = extract_username_from_url(url, "TikTok")
+        if not username:
+            self.show_temporary_message("Error", "URL de TikTok no válida.")
+            return []
+
+        directorio_salida = os.path.join(self.download_path, 'TikTok', sanitize_filename(username))
+        os.makedirs(directorio_salida, exist_ok=True)
+
+        videos_descargados = []
+        errors = []
+
+        def progress_hook(d):
+            if d['status'] == 'finished':
+                self.progress.set(100)
+                filename = d['filename']
+                video_info = d.get('info_dict', {})
+                video_title = video_info.get('description', None)
+                if video_title:
+                    sanitized_title = sanitize_filename(video_title)
+                    new_filename = f"{self.video_counter}-{sanitized_title}.mp4"
+                else:
+                    new_filename = f"{self.video_counter}.mp4"
+                new_filepath = os.path.join(directorio_salida, new_filename)
+                if not os.path.exists(new_filepath):
+                    os.rename(filename, new_filepath)
+                    videos_descargados.append(os.path.basename(new_filepath))
+                    self.video_counter += 1
+                self.root.update()
+
+        opciones_ytdl = {
+            'outtmpl': os.path.join(directorio_salida, '%(title)s.%(ext)s'),
+            'format': 'best',
+            'retries': 10,
+            'timeout': 180,
+            'progress_hooks': [progress_hook]
+        }
+
+        try:
+            with YoutubeDL(opciones_ytdl) as ydl:
+                ydl.download([url])
+            self.progress.set(100)
+            write_downloaded_videos_txt(directorio_salida, videos_descargados)
+        except Exception as e:
+            error_message = str(e)
+            logging.error(f"No se pudo descargar el video: {error_message}")
+            if 'No video formats found' in error_message:
+                logging.error(f"No se pudieron encontrar formatos de video para la URL proporcionada: {url}. Es posible que el video no esté disponible públicamente o que TikTok haya cambiado su estructura de página.")
+            elif 'status code 100004' in error_message:
+                logging.warning(f"No se pudo descargar el video {url}: Video no disponible (código de estado 100004).")
+            elif 'HTTP Error 500' in error_message:
+                logging.warning(f"No se pudo descargar el video {url}: Error interno del servidor (código 500).")
+            else:
+                logging.error(f"No se pudo descargar el video: {error_message}")
+            errors.append(url)
+            
+            self.root.after(3000, lambda: self.continue_download())
+
+        self.progress.set(0)  # Reset the progress bar for the next video
+
+        return errors
+
+    def continue_download(self):
+        return True
+
+    def start_download_youtube(self, url, download_videos, download_shorts):
+        if not url.startswith("https://www.youtube.com/"):
+            self.show_temporary_message("Error", "URL del canal no válida")
+            return []
+
+        channel_name = url.split('/')[-1]
+        channel_path = os.path.join(self.download_path, 'YouTube', sanitize_filename(channel_name))
+        os.makedirs(channel_path, exist_ok=True)
+
+        videos_path = os.path.join(channel_path, 'Videos')
+        shorts_path = os.path.join(channel_path, 'Shorts')
+        os.makedirs(videos_path, exist_ok=True)
+        os.makedirs(shorts_path, exist_ok=True)
+
+        videos_descargados = []
+        shorts_descargados = []
+        errors = []
+
+        def youtube_progress_hook(d):
+            if d['status'] == 'finished':
+                self.progress.set(100)
+                filename = d['filename']
+                counter = self.video_counter
+                new_filename = clean_filename(counter, os.path.basename(filename))
+                new_filepath = os.path.join(shorts_path if 'Shorts' in filename else videos_path, new_filename)
+                if not new_filepath.endswith(".mp4"):
+                    new_filepath += ".mp4"
+                if not os.path.exists(new_filepath):
+                    os.rename(filename, new_filepath)
+                    if 'Shorts' in filename:
+                        shorts_descargados.append(os.path.basename(new_filepath))
+                    else:
+                        videos_descargados.append(os.path.basename(new_filepath))
+                    self.video_counter += 1
+                self.root.update()
+
+        opciones_ytdl_videos = {
+            'format': 'mp4',
+            'outtmpl': os.path.join(videos_path, '%(title)s.%(ext)s'),
+            'retries': 10,
+            'progress_hooks': [youtube_progress_hook],
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }],
+        }
+
+        opciones_ytdl_shorts = {
+            'format': 'mp4',
+            'outtmpl': os.path.join(shorts_path, '%(title)s.%(ext)s'),
+            'retries': 10,
+            'progress_hooks': [youtube_progress_hook],
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }],
+        }
+
+        try:
+            if download_videos:
+                with YoutubeDL(opciones_ytdl_videos) as ydl_videos:
+                    ydl_videos.download([url])
+
+            if download_shorts:
+                with YoutubeDL(opciones_ytdl_shorts) as ydl_shorts:
+                    ydl_shorts.download([url + "/shorts"])
+
+            self.progress.set(100)
+            write_downloaded_videos_txt(videos_path, videos_descargados)
+            write_downloaded_videos_txt(shorts_path, shorts_descargados)
+        except Exception as e:
+            logging.error(f"No se pudo descargar el video: {e}")
+            errors.append(url)
+        
+        self.progress.set(0)  # Reset the progress bar for the next video
+
+        return errors
+
+    def download_profile_instagram(self, url_or_username, download_reels, download_posts):
+        if 'instagram.com' in url_or_username:
+            username = extract_username_from_url(url_or_username, "Instagram")
+        else:
+            username = url_or_username.lstrip('@')
+
+        if not username:
+            self.show_temporary_message("Error", "Por favor ingrese una URL o nombre de usuario de Instagram válido.")
+            return []
+
+        download_path = os.path.join(self.download_path, 'Instagram', sanitize_filename(username))
+        os.makedirs(download_path, exist_ok=True)
+
+        reels_path = os.path.join(download_path, 'Reels')
+        posts_path = os.path.join(download_path, 'Posts')
+        os.makedirs(reels_path, exist_ok=True)
+        os.makedirs(posts_path, exist_ok=True)
+
+        loader = self.loader
+        errors = []
+
+        try:
+            profile = Profile.from_username(loader.context, username)
+        except ConnectionException as e:
+            self.show_temporary_message("Error", f"No se pudo obtener el perfil: {e}")
+            logging.error(f"No se pudo obtener el perfil: {e}")
+            return []
+        except QueryReturnedBadRequestException as e:
+            self.show_temporary_message("Error", f"No se pudo obtener el perfil: {e}")
+            logging.error(f"No se pudo obtener el perfil: {e}")
+            return []
+        except Exception as e:
+            self.show_temporary_message("Error", f"Un error inesperado ocurrió: {e}")
+            logging.error(f"Un error inesperado ocurrió: {e}")
+            return []
+
+        if profile.is_private:
+            self.show_temporary_message("Error", "El perfil es privado. No se pueden descargar los reels ni las publicaciones.")
+            return []
+
+        try:
+            posts = list(profile.get_posts())
+        except ConnectionException as e:
+            self.show_temporary_message("Error", f"Problema de conexión: {e}")
+            logging.error(f"Problema de conexión: {e}")
+            return []
+        except QueryReturnedBadRequestException as e:
+            self.show_temporary_message("Error de petición: Por favor intente más tarde.")
+            logging.error(f"Error de petición: {e}")
+            return []
+        except Exception as e:
+            self.show_temporary_message("Error", f"Un error inesperado ocurrió: {e}")
+            logging.error(f"Un error inesperado ocurrió: {e}")
+            return []
+
+        total_posts = len(posts)
+        logging.info(f"Total de publicaciones a descargar: {total_posts}")  # Añadir logging para depuración
+
+        self.progress_bar.config(maximum=total_posts)
+        self.progress.set(0)
+
+        reels_descargados = []
+        posts_descargados = []
+
+        for index, post in enumerate(posts):
+            try:
+                full_title = post.caption if post.caption else f"Post_{index + 1}"
+                sanitized_title = sanitize_filename(full_title)
+                counter = self.video_counter
+                
+                if download_reels and post.is_video:
+                    loader.dirname_pattern = reels_path
+                    filename = f"{counter}-{sanitized_title}.mp4"
+                    new_filepath = os.path.join(reels_path, filename)
+                    if not os.path.exists(new_filepath):
+                        reels_descargados.append(filename)
+                    loader.download_post(post, target=profile.username)
+                    for file in os.listdir(loader.dirname_pattern):
+                        if file.endswith(".mp4"):
+                            new_filepath = os.path.join(loader.dirname_pattern, f"{counter}-{sanitized_title}.mp4")
+                            if not os.path.exists(new_filepath):
+                                os.rename(os.path.join(loader.dirname_pattern, file), new_filepath)
+                elif download_posts and not post.is_video:
+                    loader.dirname_pattern = posts_path
+                    filename = f"{counter}-{sanitized_title}.jpg"
+                    new_filepath = os.path.join(posts_path, filename)
+                    if not os.path.exists(new_filepath):
+                        posts_descargados.append(filename)
+                        loader.download_post(post, target=profile.username)
+                        for file in os.listdir(loader.dirname_pattern):
+                            if file.endswith(".jpg"):
+                                new_filepath = os.path.join(loader.dirname_pattern, f"{counter}-{sanitized_title}.jpg")
+                                if not os.path.exists(new_filepath):
+                                    os.rename(os.path.join(loader.dirname_pattern, file), new_filepath)
+                
+                self.video_counter += 1
+                self.progress.set(index + 1)
+                self.root.update()
+
+            except Exception as e:
+                error_message = f"Error descargando post {index + 1}: {e}"
+                logging.error(error_message)
+                errors.append(error_message)
+                continue  # Continuar con la siguiente publicación en caso de error
+
+        remove_non_video_files(reels_path)
+        remove_json_xz_files(download_path)
+        write_downloaded_videos_txt(reels_path, reels_descargados)
+        write_downloaded_videos_txt(posts_path, posts_descargados)
+
+        self.progress.set(100)
+
+        return errors
+
+    def obtener_urls(self):
+        perfil_tiktok = self.perfil_entry.get()
+        ruta_guardado_base = self.download_path
+
+        if not perfil_tiktok:
+            self.show_temporary_message("Error", "Por favor, ingrese una URL de perfil de TikTok.")
+            return
+
+        if not ruta_guardado_base:
+            self.show_temporary_message("Error", "Por favor, ingrese la ruta de guardado.")
+            return
+
+        def scraping():
+            driver = webdriver.Chrome(service=Service(driver_path))
+            try:
+                # Abre el perfil de TikTok
+                driver.get(perfil_tiktok)
+                time.sleep(5)  # Espera para cargar la página
+
+                last_height = driver.execute_script("return document.body.scrollHeight")
+
+                while True:
+                    # Desplázate hacia abajo para cargar más vídeos
+                    driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.END)
+                    time.sleep(10)
+
+                    # Espera a que se carguen más vídeos
+                    time.sleep(5)
+
+                    # Calcula la nueva altura de la página después de desplazarte hacia abajo
+                    new_height = driver.execute_script("return document.body.scrollHeight")
+
+                    # Si la altura no ha cambiado, hemos llegado al final de la página
+                    if new_height == last_height:
+                        break
+
+                    last_height = new_height
+
+                # Encuentra todos los enlaces de los vídeos
+                videos = driver.find_elements(By.XPATH, '//a[contains(@href, "/video/")]')
+                urls = [video.get_attribute('href') for video in videos]
+
+                # Extrae el nombre del canal de la URL
+                canal = perfil_tiktok.split('@')[-1].split('?')[0]
+
+                # Define la ruta de guardado con el nombre del canal
+                ruta_guardado = os.path.join(ruta_guardado_base, f'log_tiktok_{canal}.txt')
+
+                # Guarda las URLs en un archivo log
+                with open(ruta_guardado, 'w') as file:
+                    for url in urls:
+                        file.write(f'{url}\n')
+
+                # Muestra las URLs en el área de texto
+                self.text_area.delete('1.0', tk.END)
+                for url in urls:
+                    self.text_area.insert(tk.END, f'{url}\n')
+
+                self.total_label.config(text=f"Total de URLs encontradas: {len(urls)}")
+
+                messagebox.showinfo("Éxito", f"URLs guardadas en {ruta_guardado}")
+            except Exception as e:
+                self.show_temporary_message("Error", str(e))
+            finally:
+                driver.quit()
+
+        thread = Thread(target=scraping)
+        thread.start()
+
+    def copiar_urls(self):
+        urls = self.text_area.get('1.0', tk.END).strip()
+        if urls:
+            pyperclip.copy(urls)
+            messagebox.showinfo("Éxito", "URLs copiadas al portapapeles")
+        else:
+            messagebox.showerror("Error", "No hay URLs para copiar")
+
+    def exit_application(self):
+        self.root.quit()
+        self.root.destroy()
+
+# Iniciar la aplicación
+if __name__ == "__main__":
+    try:
+        root = tk.Tk()
+        app = DescargadorRedesSociales(root)
+        root.mainloop()
+    except Exception as e:
+        logging.error(f"Error inesperado: {e}")
+        input("Presione Enter para salir...")
